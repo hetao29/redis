@@ -14,7 +14,7 @@ import (
 )
 
 const (
-    defaultPoolSize = 5
+    defaultPoolSize = 50
 )
 
 var defaultAddr = "127.0.0.1:6379"
@@ -104,22 +104,16 @@ func readResponse(reader *bufio.Reader) (interface{}, error) {
 
     if line[0] == '+' {
         return strings.TrimSpace(line[1:]), nil
-    }
-
-    if strings.HasPrefix(line, "-ERR ") {
-        errmesg := strings.TrimSpace(line[5:])
+    }else if line[0] == '-' {
+        errmesg := strings.TrimSpace(line[1:])
         return nil, RedisError(errmesg)
-    }
-
-    if line[0] == ':' {
+    }else if line[0] == ':' {
         n, err := strconv.ParseInt(strings.TrimSpace(line[1:]), 10, 64)
         if err != nil {
             return nil, RedisError("Int reply is not a number")
         }
         return n, nil
-    }
-
-    if line[0] == '*' {
+    }else if line[0] == '*' {
         size, err := strconv.Atoi(strings.TrimSpace(line[1:]))
         if err != nil {
             return nil, RedisError("MultiBulk reply expected a number")
@@ -202,7 +196,7 @@ func (client *Client) sendCommand(cmd string, args ...string) (data interface{},
 
     b = commandBytes(cmd, args...)
     data, err = client.rawSend(c, b)
-    if err == io.EOF {
+    if err == io.EOF || err == io.ErrClosedPipe || err == io.ErrUnexpectedEOF{
         c, err = client.openConnection()
         if err != nil {
             println(err.Error())
@@ -298,8 +292,11 @@ func (client *Client) sendCommands(cmdArgs <-chan []string, data chan<- interfac
 
 End:
 
-    // Close client and synchronization issues are a nightmare to solve.
-    c.Close()
+//如果是错误的，把error也写回去
+if (err !=nil){
+	data <- err
+}
+// Close client and synchronization issues are a nightmare to solve.
 
     // Push nil back onto queue
     client.pushCon(nil)
@@ -636,24 +633,23 @@ func (client *Client) Strlen(key string) (int, error) {
 
 // List commands
 
-func (client *Client) Rpush(key string, val []byte) error {
-    _, err := client.sendCommand("RPUSH", key, string(val))
+func (client *Client) Rpush(key string, val []byte) (int,error ){
+    res, err := client.sendCommand("RPUSH", key, string(val))
 
     if err != nil {
-        return err
+        return -1,err
     }
-
-    return nil
+    return int(res.(int64)), nil
 }
 
-func (client *Client) Lpush(key string, val []byte) error {
-    _, err := client.sendCommand("LPUSH", key, string(val))
+func (client *Client) Lpush(key string, val []byte) (int,error ){
+    res, err := client.sendCommand("LPUSH", key, string(val))
 
     if err != nil {
-        return err
+        return -1,err
     }
 
-    return nil
+    return int(res.(int64)), nil
 }
 
 func (client *Client) Llen(key string) (int, error) {
@@ -967,6 +963,19 @@ func (client *Client) Zrange(key string, start int, end int) ([][]byte, error) {
     return res.([][]byte), nil
 }
 
+func (client *Client) Zrangewithscore(key string, start int, end int) (value [][]byte,score [][]byte, err error) {
+	res, err := client.sendCommand("ZRANGE", key, strconv.Itoa(start), strconv.Itoa(end), "WITHSCORES")
+	if err != nil {
+		return nil, nil,err
+	}
+	l:=len(res.([][]byte));
+	for i:=0;i<l;i=i+2{
+		value = append(value, res.([][]byte)[i]);
+		score = append(score, res.([][]byte)[i+1]);
+	}
+	return
+}
+
 func (client *Client) Zrevrange(key string, start int, end int) ([][]byte, error) {
     res, err := client.sendCommand("ZREVRANGE", key, strconv.Itoa(start), strconv.Itoa(end))
     if err != nil {
@@ -983,6 +992,33 @@ func (client *Client) Zrangebyscore(key string, start float64, end float64) ([][
     }
 
     return res.([][]byte), nil
+}
+//for 定制1/2 by hetal,根据id正向取
+func (client *Client) Zrangebyscorelimit(key string, min float64,  count float64) ([][]byte, error) {
+    res, err := client.sendCommand("ZRANGEBYSCORE", key, "("+strconv.FormatFloat(min, 'f', -1, 64), "+inf", "LIMIT" , "0", strconv.FormatFloat(count, 'f', -1, 64))
+    if err != nil {
+        return nil, err
+    }
+
+    return res.([][]byte), nil
+}
+//for 定制2/2 by hetal,根据id反向取,然后进行排序
+//如果max为0，变成 "+inf"
+func (client *Client) Zrangebyscorelimitdesc(key string, max float64,  count float64) ([][]byte, error) {
+	if(max<=0){
+		res, err := client.sendCommand("ZREVRANGEBYSCORE", key, "+inf", "-inf", "LIMIT" , "0", strconv.FormatFloat(count, 'f', -1, 64))
+		if err != nil {
+			return nil, err
+		}
+		return res.([][]byte), nil
+
+	}else{
+		res, err := client.sendCommand("ZREVRANGEBYSCORE", key, "("+strconv.FormatFloat(max, 'f', -1, 64),"-inf", "LIMIT" , "0", strconv.FormatFloat(count, 'f', -1, 64))
+		if err != nil {
+			return nil, err
+		}
+		return res.([][]byte), nil
+	}
 }
 
 func (client *Client) Zcount(key string, min float64, max float64) (int, error) {
@@ -1332,6 +1368,7 @@ type Message struct {
     ChannelMatched string
     Channel        string
     Message        []byte
+	Error bool
 }
 
 // Subscribe to redis serve channels, this method will block until one of the sub/unsub channels are closed.
@@ -1340,6 +1377,10 @@ type Message struct {
 // Closing either of these channels will unblock this method call.
 // Messages that are received are sent down the messages channel.
 func (client *Client) Subscribe(subscribe <-chan string, unsubscribe <-chan string, psubscribe <-chan string, punsubscribe <-chan string, messages chan<- Message) error {
+	defer func() {
+		if err := recover(); err != nil {
+		}
+	}()
     cmds := make(chan []string, 0)
     data := make(chan interface{}, 0)
 
@@ -1370,29 +1411,36 @@ func (client *Client) Subscribe(subscribe <-chan string, unsubscribe <-chan stri
     }()
 
     go func() {
-        for response := range data {
-            db := response.([][]byte)
-            messageType := string(db[0])
-            switch messageType {
-            case "message":
-                channel, message := string(db[1]), db[2]
-                messages <- Message{channel, channel, message}
-            case "subscribe":
-                // Ignore
-            case "unsubscribe":
-                // Ignore
-            case "pmessage":
-                channelMatched, channel, message := string(db[1]), string(db[2]), db[3]
-                messages <- Message{channelMatched, channel, message}
-            case "psubscribe":
-                // Ignore
-            case "punsubscribe":
-                // Ignore
+		for response := range data {
+			switch response.(type){
+			case [][]byte:
+				db := response.([][]byte)
+				messageType := string(db[0])
+				switch messageType {
+				case "message":
+					channel, message := string(db[1]), db[2]
+					messages <- Message{channel, channel, message,false}
+				case "subscribe":
+					// Ignore
+				case "unsubscribe":
+					// Ignore
+				case "pmessage":
+					channelMatched, channel, message := string(db[1]), string(db[2]), db[3]
+					messages <- Message{channelMatched, channel, message,false}
+				case "psubscribe":
+					// Ignore
+				case "punsubscribe":
+					// Ignore
 
-            default:
-                // log.Printf("Unknown message '%s'", messageType)
-            }
-        }
+				default:
+					// log.Printf("Unknown message '%s'", messageType)
+				}
+			case error:
+			var msg Message;
+			msg.Error = true
+				messages <- msg
+			}
+		}
     }()
 
     err := client.sendCommands(cmds, data)
